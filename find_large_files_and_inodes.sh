@@ -1,230 +1,153 @@
 #!/bin/bash
+# Help4 Network Property - Public License - Version 1.5.3 (unchanged terms)
+VERSION="1.5.3-stable"
+set -euo pipefail
+export LC_ALL=C
 
-# Help4 Network Property - Public License - Version 1.4
-#
-# License:
-# This script is free for public use under the following terms:
-# 1. For **public and personal use**, this script is free of charge.
-# 2. For **commercial use**, public credit to Help4 Network is required for each and every use.
-#    - All output, including credit lines, must remain intact and cannot be edited or omitted.
-#    - This includes any usage in reports, scripts, distributions, or communications.
-# 3. Commercial entities are free to use and distribute this script, but they **must** include this 
-#    license and public credit to Help4 Network in any instance of usage, sharing, or distribution.
-#
-# Redistribution of this script without this license intact is prohibited.
+# ---------- config ----------
+TOP_FILES=20
+INODE_THRESHOLD=10000           # flag dirs holding > this many files (immediate files, not recursive)
+LARGE_FILE_BYTES=$((1<<30))     # 1 GiB
+EXCLUDE_DIRS=(virtfs cloudlinux some_other_system_dir)
+KNOWN_USER_PATTERN='^[a-zA-Z0-9][a-zA-Z0-9_-]*$'
+PARALLEL=0                      # 0=sequential; 1=background per-user
 
-VERSION="1.4"
-
-# Configurable variables
-TOP_FILES=20                   # Number of top largest files per user
-INODE_THRESHOLD=10000          # Threshold for high inode usage
-EXCLUDE_DIRS=("virtfs" "cloudlinux" "some_other_system_dir") # Directories to exclude
-KNOWN_USER_PATTERN="^[a-zA-Z0-9][a-zA-Z0-9_-]*$"  # Pattern for valid cPanel usernames
-
-# Function to check if the directory should be excluded
+# ---------- helpers ----------
 is_excluded_dir() {
-    local dir_name=$1
-    for excluded in "${EXCLUDE_DIRS[@]}"; do
-        if [[ "$dir_name" == "$excluded" ]]; then
-            return 0
-        fi
-    done
-    return 1
+  local d=${1##*/}
+  for e in "${EXCLUDE_DIRS[@]}"; do [ "$d" = "$e" ] && return 0; done
+  return 1
+}
+hr() { numfmt --to=iec --suffix=B "$1"; }
+rule() { echo "---- $* ----"; }
+
+# dedupe /home roots by device+inode (if /home2 -> /home, keep only one)
+get_home_roots() {
+  local roots=()
+  [ -d /home ]  && roots+=("/home")
+  [ -e /home2 ] && roots+=("/home2")
+  if [ "${#roots[@]}" -le 1 ]; then
+    echo "${roots[@]}"; return
+  fi
+  local s1 s2
+  s1=$(stat -Lc '%d:%i' "${roots[0]}" 2>/dev/null || echo x)
+  s2=$(stat -Lc '%d:%i' "${roots[1]}" 2>/dev/null || echo y)
+  if [ "$s1" = "$s2" ]; then
+    echo "${roots[0]}"
+  else
+    echo "${roots[@]}"
+  fi
 }
 
-# Function to find and display the largest files in a user's home directory
-find_largest_files() {
-    local user_home=$1
-    local user=$(basename "$user_home")
-    echo "Top $TOP_FILES largest files for user: $user"
+say() { echo "$*"; }
 
-    # Find the largest files, excluding system files and directories
-    find "$user_home" -type f -exec du -h {} + 2>/dev/null | sort -rh | head -n $TOP_FILES
-    echo
-}
+# ---------- start ----------
+say "Starting directory analysis (Version $VERSION)"
+rule "Top-level usage of /"
+du -x -h -d1 / 2>/dev/null | sort -hr | head -50
+echo
 
-# Function to find directories with large inode usage for a user
-find_large_inodes() {
-    local user_home=$1
-    local user=$(basename "$user_home")
-    echo "Checking for high inode usage in $user's home directory..."
+# home roots
+read -r -a HOME_ROOTS <<<"$(get_home_roots)"
+[ "${#HOME_ROOTS[@]}" -eq 0 ] && HOME_ROOTS=("/home")
 
-    # Find directories with inode usage greater than the threshold
-    find "$user_home" -type d 2>/dev/null | while read -r dir; do
-        inode_count=$(find "$dir" -type f 2>/dev/null | wc -l)
-        if [ "$inode_count" -gt "$INODE_THRESHOLD" ]; then
-            echo "$dir: $inode_count files"
-        fi
-    done
-    echo
-}
+# per-home totals
+for H in "${HOME_ROOTS[@]}"; do
+  [ -d "$H" ] || continue
+  sz=$(du -x -B1 -s "$H" 2>/dev/null | awk '{print $1}')
+  echo "Total size of $H: $(hr "${sz:-0}")"
+done
+echo
 
-# Function to calculate the total size of user directories, excluding system directories
-calculate_user_dirs_size() {
-    local home_dir=$1
-    local total_size=0
-    for user_home in "$home_dir"/*; do
-        if [ -d "$user_home" ]; then
-            base_user=$(basename "$user_home")
-
-            # Skip excluded directories
-            if is_excluded_dir "$base_user"; then
-                >&2 echo "Skipping system directory: $base_user"
-                continue
-            fi
-
-            # Add size of the user directory
-            user_size=$(du -sb "$user_home" 2>/dev/null | awk '{print $1}')
-            total_size=$((total_size + user_size))
-        fi
-    done
-    echo "$total_size"
-}
-
-# Function to find erroneous or abnormal directories
-find_erroneous_folders() {
-    local home_dir=$1
-    echo "Checking for erroneous or abnormal directories in $home_dir..."
-    for folder in "$home_dir"/*; do
-        if [ -d "$folder" ]; then
-            base_folder=$(basename "$folder")
-
-            # If folder doesn't match known user pattern and is not in excluded list
-            if ! [[ "$base_folder" =~ $KNOWN_USER_PATTERN ]] && ! is_excluded_dir "$base_folder"; then
-                folder_size=$(du -sh "$folder" 2>/dev/null | awk '{print $1}')
-                echo "Erroneous folder found: $base_folder ($folder_size)"
-            fi
-        fi
-    done
-    echo
-}
-
-# Convert bytes to human-readable format
-convert_size_to_human() {
-    numfmt --to=iec --suffix=B "$1"
-}
-
-# Main script
-echo "Starting directory analysis (Version $VERSION)..."
-
-# Collect list of user home directories to exclude from system checks
+# collect user dirs
 USER_DIRS=()
-for home_dir in /home*; do
-    if [ -d "$home_dir" ]; then
-        for user_home in "$home_dir"/*; do
-            if [ -d "$user_home" ]; then
-                base_user=$(basename "$user_home")
-
-                # Skip excluded directories
-                if is_excluded_dir "$base_user"; then
-                    continue
-                fi
-
-                USER_DIRS+=("$user_home")
-            fi
-        done
-    fi
+for H in "${HOME_ROOTS[@]}"; do
+  [ -d "$H" ] || continue
+  while IFS= read -r -d '' u; do
+    bn=${u##*/}
+    is_excluded_dir "$bn" && continue
+    [[ $bn =~ $KNOWN_USER_PATTERN ]] || continue
+    USER_DIRS+=("$u")
+  done < <(find "$H" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
 done
 
-# Check /home* directories
-for home_dir in /home*; do
-    if [ -d "$home_dir" ]; then
-        # Get total size of /home* directory
-        total_home_size=$(du -sb "$home_dir" 2>/dev/null | awk '{print $1}')
+largest_files_for_user() {
+  local u="$1" bn="${1##*/}"
+  rule "Top ${TOP_FILES} files for user: ${bn}"
+  find "$u" -xdev -type f -printf '%s\t%p\n' 2>/dev/null \
+    | sort -k1,1nr \
+    | head -n "$TOP_FILES" \
+    | numfmt --to=iec --suffix=B --field=1 --delimiter=$'\t'
+  echo
+}
 
-        # Calculate total size of user directories
-        total_user_size=$(calculate_user_dirs_size "$home_dir")
+inode_hotspots_for_user() {
+  local u="$1"
+  find "$u" -xdev -type f -printf '%h\n' 2>/dev/null \
+    | sort | uniq -c \
+    | awk -v T="$INODE_THRESHOLD" '$1>T {print "High inode usage: " $2 " - " $1 " files"}'
+  echo
+}
 
-        # Convert sizes to human-readable format
-        total_home_size_human=$(convert_size_to_human "$total_home_size")
-        total_user_size_human=$(convert_size_to_human "$total_user_size")
+anomalies_in_home_root() {
+  local H="$1"
+  rule "Anomalous folders in $H"
+  while IFS= read -r -d '' f; do
+    base=${f##*/}
+    is_excluded_dir "$base" && continue
+    [[ $base =~ $KNOWN_USER_PATTERN ]] && continue
+    du -sh "$f" 2>/dev/null | awk '{print "Erroneous folder: " $2 " (" $1 ")"}'
+  done < <(find "$H" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  echo
+}
 
-        # Display sizes
-        echo "Total size of all /home* directories: $total_home_size_human"
-        echo "Total size of user directories: $total_user_size_human"
-
-        # Compare the total size of /home* and sum of user directories
-        if [ "$total_home_size" -ne "$total_user_size" ]; then
-            echo "Warning: There is a size difference between /home* and the sum of user directories!"
-        else
-            echo "The total size of /home* matches the sum of user directories."
-        fi
-
-        # Check for erroneous or abnormal folders
-        find_erroneous_folders "$home_dir"
-
-        # Process each user directory
-        for user_home in "$home_dir"/*; do
-            if [ -d "$user_home" ]; then
-                base_user=$(basename "$user_home")
-
-                # Skip excluded directories
-                if is_excluded_dir "$base_user"; then
-                    echo "Skipping system directory: $base_user"
-                    continue
-                fi
-
-                # Process user home directory
-                find_largest_files "$user_home"
-                find_large_inodes "$user_home"
-            fi
-        done
-    fi
+# anomalies per home root
+for H in "${HOME_ROOTS[@]}"; do
+  [ -d "$H" ] && anomalies_in_home_root "$H"
 done
 
-# System directories to check (excluding /proc and /home*)
-SYSTEM_DIRS=("/" "/var" "/usr" "/tmp" "/var/tmp" "/var/log")
-# Remove duplicates and ensure they don't include user directories
-SYSTEM_DIRS_UNIQUE=($(printf "%s\n" "${SYSTEM_DIRS[@]}" | sort -u))
+# per-user scans
+rule "Per-user largest files and inode hotspots"
+if [ "$PARALLEL" -eq 1 ]; then
+  pids=()
+  for u in "${USER_DIRS[@]}"; do
+    ( largest_files_for_user "$u"; inode_hotspots_for_user "$u" ) & pids+=($!)
+  done
+  for p in "${pids[@]}"; do wait "$p"; done
+else
+  for u in "${USER_DIRS[@]}"; do
+    largest_files_for_user "$u"
+    inode_hotspots_for_user "$u"
+  done
+fi
 
-# Build find command exclude options
-EXCLUDE_PATHS=("-path" "/proc" "-prune" "-o")
-for home_dir in /home*; do
-    EXCLUDE_PATHS+=("-path" "$home_dir" "-prune" "-o")
-done
+# build prune array for system-wide scans
+PRUNE=( -path /proc -prune -o -path /sys -prune -o -path /dev -prune -o )
+for H in "${HOME_ROOTS[@]}"; do PRUNE+=( -path "$H" -prune -o ); done
+for e in "${EXCLUDE_DIRS[@]}"; do PRUNE+=( -path "*/$e/*" -prune -o ); done
 
-# Exclude additional user directories
-for user_dir in "${USER_DIRS[@]}"; do
-    EXCLUDE_PATHS+=("-path" "$user_dir" "-prune" "-o")
-done
+rule "Large files (>= $(hr $LARGE_FILE_BYTES)) outside /home*"
+/usr/bin/find / "${PRUNE[@]}" -type f -size +"${LARGE_FILE_BYTES}c" -printf '%s\t%p\n' 2>/dev/null \
+  | sort -k1,1nr \
+  | numfmt --to=iec --suffix=B --field=1 --delimiter=$'\t' \
+  | head -200
+echo
 
-# Exclude specified directories in EXCLUDE_DIRS
-for exclude_dir in "${EXCLUDE_DIRS[@]}"; do
-    EXCLUDE_PATHS+=("-path" "*/$exclude_dir" "-prune" "-o")
-done
+rule "Inode hotspots (immediate dir > ${INODE_THRESHOLD} files) outside /home*"
+/usr/bin/find / "${PRUNE[@]}" -type f -printf '%h\n' 2>/dev/null \
+  | sort | uniq -c \
+  | awk -v T="$INODE_THRESHOLD" '$1>T {printf "%7d\t%s\n",$1,$2}'
+echo
 
-# Check system areas
-echo "Checking system directories (excluding /proc, /home*, user directories, and excluded directories)..."
-for system_dir in "${SYSTEM_DIRS_UNIQUE[@]}"; do
-    if [ -d "$system_dir" ] && [[ "$system_dir" != "/proc" ]] && [[ "$system_dir" != /home* ]]; then
-        echo "Analyzing $system_dir..."
-        # Find high inode usage and large files, excluding /proc, /home*, user directories, and excluded directories
-        find "$system_dir" "${EXCLUDE_PATHS[@]}" \( -type d -o -type f \) 2>/dev/null | while read -r item; do
-            # Skip if the item is in /proc or /home*
-            if [[ "$item" == /proc* ]] || [[ "$item" == /home* ]]; then
-                continue
-            fi
-
-            # For directories, check inode usage
-            if [ -d "$item" ]; then
-                inode_count=$(find "$item" -type f 2>/dev/null | wc -l)
-                if [ "$inode_count" -gt "$INODE_THRESHOLD" ]; then
-                    echo "High inode usage: $item - $inode_count files"
-                fi
-            fi
-
-            # For files, check if size exceeds threshold (e.g., 1GB)
-            if [ -f "$item" ]; then
-                file_size=$(du -b "$item" 2>/dev/null | awk '{print $1}')
-                if [ "$file_size" -ge $((1*1024*1024*1024)) ]; then
-                    file_size_human=$(du -h "$item" 2>/dev/null | awk '{print $1}')
-                    echo "Large file: $item - $file_size_human"
-                fi
-            fi
-        done
-        echo
-    fi
-done
+# deleted-but-open files (space leaks)
+if command -v lsof >/dev/null 2>&1; then
+  rule "Deleted-but-open files (space leaks)"
+  lsof +L1 -nP 2>/dev/null | awk '$7 ~ /^[0-9]+$/ {print $7 "\t" $9}' \
+    | sort -nr \
+    | numfmt --to=iec --suffix=B --field=1 --delimiter=$'\t' \
+    | head -50
+  echo
+fi
 
 echo "Directory analysis complete."
 echo "Script provided by Help4 Network. Public credit required for commercial use."
