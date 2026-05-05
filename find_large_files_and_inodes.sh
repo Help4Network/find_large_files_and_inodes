@@ -1,153 +1,495 @@
-#!/bin/bash
-# Help4 Network Property - Public License - Version 1.5.3 (unchanged terms)
-VERSION="1.5.3-stable"
-set -euo pipefail
+#!/usr/bin/env bash
+# ==============================================================================
+# Help4 Network Property - Public License
+# Find Large Files and Inodes
+# Version 1.7.0
+#
+# TERMS OF USAGE:
+# This script is FREE to use by end users.
+#
+# Commercial use is allowed ONLY if proper credit is preserved and shown when
+# handing this script, its output, or a derived version to customers.
+#
+# Required commercial credit:
+#   Phillip Ley - https://phillipley.com
+#   Help4 Network - https://help4wordpress.com
+#
+# Do not remove this notice from redistributed copies.
+# ==============================================================================
+
+set -uo pipefail
 export LC_ALL=C
 
-# ---------- config ----------
-TOP_FILES=20
-INODE_THRESHOLD=10000           # flag dirs holding > this many files (immediate files, not recursive)
-LARGE_FILE_BYTES=$((1<<30))     # 1 GiB
-EXCLUDE_DIRS=(virtfs cloudlinux some_other_system_dir)
-KNOWN_USER_PATTERN='^[a-zA-Z0-9][a-zA-Z0-9_-]*$'
-PARALLEL=0                      # 0=sequential; 1=background per-user
+VERSION="1.7.0"
 
-# ---------- helpers ----------
-is_excluded_dir() {
-  local d=${1##*/}
-  for e in "${EXCLUDE_DIRS[@]}"; do [ "$d" = "$e" ] && return 0; done
-  return 1
+TOP_FILES="${TOP_FILES:-10}"
+LARGE_FILE_MB="${LARGE_FILE_MB:-100}"
+LARGE_FILE_BYTES=$((LARGE_FILE_MB * 1024 * 1024))
+
+GOOD_SIZE_LIMIT_GB="${GOOD_SIZE_LIMIT_GB:-25}"
+GOOD_INODE_LIMIT="${GOOD_INODE_LIMIT:-100000}"
+
+CHECK_SIZE_LIMIT_GB="${CHECK_SIZE_LIMIT_GB:-75}"
+CHECK_INODE_LIMIT="${CHECK_INODE_LIMIT:-250000}"
+
+REPORT_DIR="${REPORT_DIR:-/root}"
+REPORT_TIMESTAMP="$(date '+%Y-%m-%d_%H-%M-%S')"
+HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo server)"
+REPORT_FILE="${REPORT_FILE:-${REPORT_DIR}/help4-large-files-inodes-report-${HOSTNAME_SHORT}-${REPORT_TIMESTAMP}.txt}"
+
+EMAIL_FROM="${EMAIL_FROM:-root@${HOSTNAME_SHORT}}"
+EMAIL_SUBJECT="${EMAIL_SUBJECT:-Help4 Network Large File and Inode Report - ${HOSTNAME_SHORT} - ${REPORT_TIMESTAMP}}"
+
+TMP_ROOT="/tmp/h4-large-files-report.$$"
+
+mkdir -p "$TMP_ROOT"
+mkdir -p "$REPORT_DIR" 2>/dev/null || true
+
+cleanup() {
+    rm -rf "$TMP_ROOT"
 }
-hr() { numfmt --to=iec --suffix=B "$1"; }
-rule() { echo "---- $* ----"; }
+trap cleanup EXIT
 
-# dedupe /home roots by device+inode (if /home2 -> /home, keep only one)
-get_home_roots() {
-  local roots=()
-  [ -d /home ]  && roots+=("/home")
-  [ -e /home2 ] && roots+=("/home2")
-  if [ "${#roots[@]}" -le 1 ]; then
-    echo "${roots[@]}"; return
-  fi
-  local s1 s2
-  s1=$(stat -Lc '%d:%i' "${roots[0]}" 2>/dev/null || echo x)
-  s2=$(stat -Lc '%d:%i' "${roots[1]}" 2>/dev/null || echo y)
-  if [ "$s1" = "$s2" ]; then
-    echo "${roots[0]}"
-  else
-    echo "${roots[@]}"
-  fi
-}
-
-say() { echo "$*"; }
-
-# ---------- start ----------
-say "Starting directory analysis (Version $VERSION)"
-rule "Top-level usage of /"
-du -x -h -d1 / 2>/dev/null | sort -hr | head -50
-echo
-
-# home roots
-read -r -a HOME_ROOTS <<<"$(get_home_roots)"
-[ "${#HOME_ROOTS[@]}" -eq 0 ] && HOME_ROOTS=("/home")
-
-# per-home totals
-for H in "${HOME_ROOTS[@]}"; do
-  [ -d "$H" ] || continue
-  sz=$(du -x -B1 -s "$H" 2>/dev/null | awk '{print $1}')
-  echo "Total size of $H: $(hr "${sz:-0}")"
-done
-echo
-
-# collect user dirs
-USER_DIRS=()
-for H in "${HOME_ROOTS[@]}"; do
-  [ -d "$H" ] || continue
-  while IFS= read -r -d '' u; do
-    bn=${u##*/}
-    is_excluded_dir "$bn" && continue
-    [[ $bn =~ $KNOWN_USER_PATTERN ]] || continue
-    USER_DIRS+=("$u")
-  done < <(find "$H" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-done
-
-largest_files_for_user() {
-  local u="$1" bn="${1##*/}"
-  rule "Top ${TOP_FILES} files for user: ${bn}"
-  find "$u" -xdev -type f -printf '%s\t%p\n' 2>/dev/null \
-    | sort -k1,1nr \
-    | head -n "$TOP_FILES" \
-    | numfmt --to=iec --suffix=B --field=1 --delimiter=$'\t'
-  echo
+hr_bytes() {
+    numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1}B"
 }
 
-inode_hotspots_for_user() {
-  local u="$1"
-  find "$u" -xdev -type f -printf '%h\n' 2>/dev/null \
-    | sort | uniq -c \
-    | awk -v T="$INODE_THRESHOLD" '$1>T {print "High inode usage: " $2 " - " $1 " files"}'
-  echo
+line() {
+    printf '%*s\n' "${COLUMNS:-100}" '' | tr ' ' '='
 }
 
-anomalies_in_home_root() {
-  local H="$1"
-  rule "Anomalous folders in $H"
-  while IFS= read -r -d '' f; do
-    base=${f##*/}
-    is_excluded_dir "$base" && continue
-    [[ $base =~ $KNOWN_USER_PATTERN ]] && continue
-    du -sh "$f" 2>/dev/null | awk '{print "Erroneous folder: " $2 " (" $1 ")"}'
-  done < <(find "$H" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-  echo
+small_line() {
+    printf '%*s\n' "${COLUMNS:-100}" '' | tr ' ' '-'
 }
 
-# anomalies per home root
-for H in "${HOME_ROOTS[@]}"; do
-  [ -d "$H" ] && anomalies_in_home_root "$H"
-done
+print_terms_full() {
+    echo "TERMS OF USAGE:"
+    echo "  This script is FREE to use by end users."
+    echo
+    echo "  Commercial use is allowed ONLY if proper credit is preserved and shown"
+    echo "  when handing this script, its output, or a derived version to customers."
+    echo
+    echo "  Required commercial credit:"
+    echo "    Phillip Ley - https://phillipley.com"
+    echo "    Help4 Network - https://help4wordpress.com"
+    echo
+    echo "  Do not remove this notice from redistributed copies."
+}
 
-# per-user scans
-rule "Per-user largest files and inode hotspots"
-if [ "$PARALLEL" -eq 1 ]; then
-  pids=()
-  for u in "${USER_DIRS[@]}"; do
-    ( largest_files_for_user "$u"; inode_hotspots_for_user "$u" ) & pids+=($!)
-  done
-  for p in "${pids[@]}"; do wait "$p"; done
-else
-  for u in "${USER_DIRS[@]}"; do
-    largest_files_for_user "$u"
-    inode_hotspots_for_user "$u"
-  done
-fi
+print_report_credit_header() {
+    line
+    echo "Help4 Network - Large File and Inode Report v${VERSION}"
+    echo "Created by Phillip Ley / Help4 Network"
+    echo "Phillip Ley: https://phillipley.com"
+    echo "Help4 Network: https://help4wordpress.com"
+    echo
+    echo "Customer Report Notice:"
+    echo "This report was generated using a free end-user tool created by Phillip Ley / Help4 Network."
+    echo "Commercial providers may use this tool for customers only when this credit remains visible."
+    echo
+    echo "Report File:"
+    echo "${REPORT_FILE}"
+    echo
+    echo "Generated:"
+    date
+    echo
+    echo "Server:"
+    hostname -f 2>/dev/null || hostname 2>/dev/null || echo "Unknown"
+    line
+}
 
-# build prune array for system-wide scans
-PRUNE=( -path /proc -prune -o -path /sys -prune -o -path /dev -prune -o )
-for H in "${HOME_ROOTS[@]}"; do PRUNE+=( -path "$H" -prune -o ); done
-for e in "${EXCLUDE_DIRS[@]}"; do PRUNE+=( -path "*/$e/*" -prune -o ); done
+print_report_credit_footer() {
+    line
+    echo "Report generated by Help4 Network - Large File and Inode Report v${VERSION}"
+    echo "Tool credit: Phillip Ley (https://phillipley.com) / Help4 Network (https://help4wordpress.com)"
+    echo "Free for end users. Commercial/customer use requires this visible credit in delivered reports."
+    echo "Report file: ${REPORT_FILE}"
+    line
+}
 
-rule "Large files (>= $(hr $LARGE_FILE_BYTES)) outside /home*"
-/usr/bin/find / "${PRUNE[@]}" -type f -size +"${LARGE_FILE_BYTES}c" -printf '%s\t%p\n' 2>/dev/null \
-  | sort -k1,1nr \
-  | numfmt --to=iec --suffix=B --field=1 --delimiter=$'\t' \
-  | head -200
-echo
+show_help() {
+    cat <<EOF
+Help4 Network - Large File and Inode Report v${VERSION}
 
-rule "Inode hotspots (immediate dir > ${INODE_THRESHOLD} files) outside /home*"
-/usr/bin/find / "${PRUNE[@]}" -type f -printf '%h\n' 2>/dev/null \
-  | sort | uniq -c \
-  | awk -v T="$INODE_THRESHOLD" '$1>T {printf "%7d\t%s\n",$1,$2}'
-echo
+This script scans cPanel accounts and reports:
+  - GOOD / CHECK / BAD account status
+  - Account disk usage
+  - Account inode usage
+  - Filesystem inode pool usage
+  - Top files over the configured size threshold
+  - Top inode-heavy directories for accounts needing attention
+  - Saves the final report to a TXT file
+  - Offers to email the report using the WHM/cPanel server's local mail system
 
-# deleted-but-open files (space leaks)
-if command -v lsof >/dev/null 2>&1; then
-  rule "Deleted-but-open files (space leaks)"
-  lsof +L1 -nP 2>/dev/null | awk '$7 ~ /^[0-9]+$/ {print $7 "\t" $9}' \
-    | sort -nr \
-    | numfmt --to=iec --suffix=B --field=1 --delimiter=$'\t' \
-    | head -50
-  echo
-fi
+Environment overrides:
+  TOP_FILES=10
+  LARGE_FILE_MB=100
+  GOOD_SIZE_LIMIT_GB=25
+  GOOD_INODE_LIMIT=100000
+  CHECK_SIZE_LIMIT_GB=75
+  CHECK_INODE_LIMIT=250000
 
-echo "Directory analysis complete."
-echo "Script provided by Help4 Network. Public credit required for commercial use."
+Report options:
+  REPORT_DIR=/root
+  REPORT_FILE=/root/custom-report-name.txt
+
+Email options:
+  EMAIL_FROM=root@server
+  EMAIL_SUBJECT="Help4 Network Large File and Inode Report"
+
+Examples:
+  sudo ./find_large_files_and_inodes.sh
+  sudo TOP_FILES=5 LARGE_FILE_MB=100 ./find_large_files_and_inodes.sh
+  sudo REPORT_DIR=/home/user ./find_large_files_and_inodes.sh
+  sudo REPORT_FILE=/root/customer-report.txt ./find_large_files_and_inodes.sh
+
+EOF
+
+    print_terms_full
+}
+
+get_cpanel_users() {
+    if [ -d /var/cpanel/users ]; then
+        find /var/cpanel/users -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort
+        return
+    fi
+
+    awk -F: '$6 ~ /^\/home[0-9]*\// && $3 >= 500 {print $1}' /etc/passwd | sort
+}
+
+get_user_home() {
+    local user="$1"
+    local cpanel_file="/var/cpanel/users/$user"
+    local homedir=""
+
+    if [ -f "$cpanel_file" ]; then
+        homedir="$(awk -F= '$1=="HOMEDIR" {print $2; exit}' "$cpanel_file" 2>/dev/null || true)"
+    fi
+
+    if [ -z "$homedir" ]; then
+        homedir="$(getent passwd "$user" 2>/dev/null | awk -F: '{print $6}')"
+    fi
+
+    if [ -n "$homedir" ] && [ -d "$homedir" ]; then
+        echo "$homedir"
+    fi
+}
+
+get_account_size_bytes() {
+    local homedir="$1"
+    du -sx -B1 "$homedir" 2>/dev/null | awk '{print $1}'
+}
+
+get_account_inode_count() {
+    local homedir="$1"
+
+    find "$homedir" -xdev \
+        \( \
+            -path "$homedir/virtfs" -o -path "$homedir/virtfs/*" \
+            -o -path "$homedir/.cagefs" -o -path "$homedir/.cagefs/*" \
+            -o -path "$homedir/.trash" -o -path "$homedir/.trash/*" \
+        \) -prune \
+        -o -printf '.' 2>/dev/null | wc -c
+}
+
+print_filesystem_inode_usage() {
+    local homedir="$1"
+
+    df -Pi "$homedir" 2>/dev/null | awk 'NR==2 {
+        printf "Filesystem inode pool: used=%s available=%s total=%s usage=%s mounted_on=%s\n", $3, $4, $2, $5, $6
+    }'
+}
+
+get_large_files() {
+    local homedir="$1"
+    local outfile="$2"
+
+    find "$homedir" -xdev \
+        \( \
+            -path "$homedir/virtfs" -o -path "$homedir/virtfs/*" \
+            -o -path "$homedir/.cagefs" -o -path "$homedir/.cagefs/*" \
+            -o -path "$homedir/.trash" -o -path "$homedir/.trash/*" \
+        \) -prune \
+        -o -type f -size +"${LARGE_FILE_BYTES}c" -printf '%s\t%p\n' 2>/dev/null \
+        | sort -k1,1nr \
+        | head -n "$TOP_FILES" > "$outfile"
+}
+
+print_large_files() {
+    local filelist="$1"
+
+    if [ -s "$filelist" ]; then
+        echo "Top ${TOP_FILES} files over ${LARGE_FILE_MB}MB:"
+        numfmt --to=iec --suffix=B --field=1 --delimiter=$'\t' < "$filelist" 2>/dev/null || cat "$filelist"
+    else
+        echo "Large files: none over ${LARGE_FILE_MB}MB"
+    fi
+}
+
+print_inode_hotspots() {
+    local homedir="$1"
+
+    echo "Top inode-heavy directories:"
+    find "$homedir" -xdev \
+        \( \
+            -path "$homedir/virtfs" -o -path "$homedir/virtfs/*" \
+            -o -path "$homedir/.cagefs" -o -path "$homedir/.cagefs/*" \
+            -o -path "$homedir/.trash" -o -path "$homedir/.trash/*" \
+        \) -prune \
+        -o -type f -printf '%h\n' 2>/dev/null \
+        | sort \
+        | uniq -c \
+        | sort -nr \
+        | head -n 10 \
+        | awk '{count=$1; $1=""; sub(/^ /,""); printf "%8d files\t%s\n", count, $0}'
+}
+
+classify_account() {
+    local size_bytes="$1"
+    local inode_count="$2"
+    local large_count="$3"
+
+    local good_size_bytes=$((GOOD_SIZE_LIMIT_GB * 1024 * 1024 * 1024))
+    local check_size_bytes=$((CHECK_SIZE_LIMIT_GB * 1024 * 1024 * 1024))
+
+    if [ "$large_count" -eq 0 ] && [ "$size_bytes" -lt "$good_size_bytes" ] && [ "$inode_count" -lt "$GOOD_INODE_LIMIT" ]; then
+        echo "GOOD"
+        return
+    fi
+
+    if [ "$size_bytes" -ge "$check_size_bytes" ] || [ "$inode_count" -ge "$CHECK_INODE_LIMIT" ]; then
+        echo "BAD"
+        return
+    fi
+
+    echo "CHECK"
+}
+
+print_account_report() {
+    local user="$1"
+    local homedir="$2"
+
+    local account_size_bytes="0"
+    local account_inode_count="0"
+    local large_file_list="$TMP_ROOT/${user}.largefiles"
+    local large_file_count="0"
+    local status="CHECK"
+
+    account_size_bytes="$(get_account_size_bytes "$homedir")"
+    account_size_bytes="${account_size_bytes:-0}"
+
+    account_inode_count="$(get_account_inode_count "$homedir")"
+    account_inode_count="${account_inode_count:-0}"
+
+    get_large_files "$homedir" "$large_file_list"
+    large_file_count="$(wc -l < "$large_file_list" 2>/dev/null | tr -d ' ')"
+    large_file_count="${large_file_count:-0}"
+
+    status="$(classify_account "$account_size_bytes" "$account_inode_count" "$large_file_count")"
+
+    small_line
+    echo "Account: $user"
+    echo "Home:    $homedir"
+    echo "Status:  $status"
+
+    echo
+    echo "Disk used by account:       $(hr_bytes "$account_size_bytes")"
+    echo "Inodes used by account:     $account_inode_count"
+    print_filesystem_inode_usage "$homedir"
+
+    echo
+    print_large_files "$large_file_list"
+
+    if [ "$status" = "GOOD" ]; then
+        echo
+        echo "Result: Account appears normal. No files over ${LARGE_FILE_MB}MB and inode/disk usage are within normal thresholds."
+    else
+        echo
+        print_inode_hotspots "$homedir"
+    fi
+}
+
+generate_report() {
+    local users_file="$TMP_ROOT/users.list"
+    local total_users="0"
+    local scanned_users="0"
+    local skipped_users="0"
+    local user=""
+    local homedir=""
+
+    print_report_credit_header
+
+    echo "Scan Settings:"
+    echo "Large file threshold:       ${LARGE_FILE_MB}MB"
+    echo "Top files per account:      ${TOP_FILES}"
+    echo "GOOD disk limit:            ${GOOD_SIZE_LIMIT_GB}GB"
+    echo "GOOD inode limit:           ${GOOD_INODE_LIMIT}"
+    echo "BAD disk threshold:         ${CHECK_SIZE_LIMIT_GB}GB"
+    echo "BAD inode threshold:        ${CHECK_INODE_LIMIT}"
+
+    get_cpanel_users > "$users_file"
+
+    total_users="$(wc -l < "$users_file" 2>/dev/null | tr -d ' ')"
+    total_users="${total_users:-0}"
+
+    echo "Detected cPanel users:      $total_users"
+
+    while IFS= read -r user || [ -n "$user" ]; do
+        [ -n "$user" ] || continue
+
+        homedir="$(get_user_home "$user" || true)"
+
+        if [ -z "$homedir" ]; then
+            skipped_users=$((skipped_users + 1))
+            small_line
+            echo "Account: $user"
+            echo "Status:  SKIPPED"
+            echo "Reason:  No valid home directory found."
+            continue
+        fi
+
+        scanned_users=$((scanned_users + 1))
+        print_account_report "$user" "$homedir"
+    done < "$users_file"
+
+    line
+    echo "Summary"
+    line
+    echo "Detected users: $total_users"
+    echo "Scanned users:  $scanned_users"
+    echo "Skipped users:  $skipped_users"
+    echo
+
+    print_report_credit_footer
+    echo
+    echo "Report complete."
+}
+
+send_report_with_sendmail() {
+    local to="$1"
+
+    if [ ! -x /usr/sbin/sendmail ]; then
+        return 1
+    fi
+
+    {
+        echo "From: ${EMAIL_FROM}"
+        echo "To: ${to}"
+        echo "Subject: ${EMAIL_SUBJECT}"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: text/plain; charset=UTF-8"
+        echo "Content-Disposition: inline"
+        echo
+        cat "$REPORT_FILE"
+    } | /usr/sbin/sendmail -t
+
+    return $?
+}
+
+send_report_with_mailx() {
+    local to="$1"
+
+    if command -v mailx >/dev/null 2>&1; then
+        mailx -r "$EMAIL_FROM" -s "$EMAIL_SUBJECT" "$to" < "$REPORT_FILE"
+        return $?
+    fi
+
+    if command -v mail >/dev/null 2>&1; then
+        mail -r "$EMAIL_FROM" -s "$EMAIL_SUBJECT" "$to" < "$REPORT_FILE"
+        return $?
+    fi
+
+    return 1
+}
+
+email_report_prompt() {
+    local answer=""
+    local to=""
+    local send_status="1"
+
+    if [ ! -s "$REPORT_FILE" ]; then
+        echo "Email skipped: report file does not exist or is empty."
+        return 1
+    fi
+
+    if [ ! -t 0 ]; then
+        echo "Email prompt skipped because this is not an interactive terminal."
+        echo "Report saved to: $REPORT_FILE"
+        return 0
+    fi
+
+    echo
+    line
+    echo "Email Report"
+    line
+    echo "Report saved to:"
+    echo "$REPORT_FILE"
+    echo
+    echo "Would you like to email this report using this WHM/cPanel server's local mail system?"
+    printf "Email report now? [y/N]: "
+    read -r answer
+
+    case "$answer" in
+        y|Y|yes|YES|Yes)
+            ;;
+        *)
+            echo "Email skipped."
+            return 0
+            ;;
+    esac
+
+    printf "Send report to email address: "
+    read -r to
+
+    if [ -z "$to" ]; then
+        echo "Email skipped: no recipient entered."
+        return 1
+    fi
+
+    echo "Sending report to: $to"
+
+    if send_report_with_sendmail "$to"; then
+        echo "Email sent using /usr/sbin/sendmail."
+        return 0
+    fi
+
+    if send_report_with_mailx "$to"; then
+        echo "Email sent using mail/mailx."
+        return 0
+    fi
+
+    echo "Email failed: no working local sendmail, mailx, or mail command was available."
+    echo "Report remains saved at: $REPORT_FILE"
+    return 1
+}
+
+main() {
+    case "${1:-}" in
+        -h|--help|help)
+            show_help
+            exit 0
+            ;;
+    esac
+
+    if ! touch "$REPORT_FILE" 2>/dev/null; then
+        echo "Could not write to report file:"
+        echo "$REPORT_FILE"
+        echo
+        echo "Try running as root or set REPORT_DIR/REPORT_FILE."
+        echo "Example:"
+        echo "  sudo REPORT_DIR=/root ./find_large_files_and_inodes.sh"
+        exit 1
+    fi
+
+    : > "$REPORT_FILE"
+
+    generate_report | tee "$REPORT_FILE"
+
+    echo
+    echo "TXT report saved to:"
+    echo "$REPORT_FILE"
+
+    email_report_prompt
+}
+
+main "$@"
